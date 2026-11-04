@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import tifffile
+import yaml
 from qtpy.QtWidgets import QFileDialog, QMessageBox
 
 import control._def
@@ -216,6 +217,106 @@ def test_clear_removes_offset(widget):
     assert not widget.has_offset
     assert widget.apply_offset(1.0, 1.0) == (1.0, 1.0)
     assert widget.btn_align.text() == "Align"
+
+
+# Channels as acquired; the first acquired one is not the first by file name, which used to win.
+ACQUIRED_CHANNELS = ["Fluorescence 488 nm Ex", "Fluorescence 405 nm Ex", "BF LED matrix full"]
+CHANNEL_IMAGES = {name: np.full((32, 32), 1000 * (i + 1), dtype=np.uint16) for i, name in enumerate(ACQUIRED_CHANNELS)}
+
+
+def _multichannel_folder(tmp_path, with_yaml=True):
+    coords = pd.DataFrame({"region": ["A1"] * 3, "x (mm)": [1.0, 2.0, 3.0], "y (mm)": [5.0] * 3})
+    coords.to_csv(tmp_path / "coordinates.csv", index=False)
+    (tmp_path / "0").mkdir()
+    for name, image in CHANNEL_IMAGES.items():
+        tifffile.imwrite(tmp_path / "0" / f"A1_1_0_{name.replace(' ', '_')}.tiff", image)
+    if with_yaml:
+        (tmp_path / "acquisition.yaml").write_text(yaml.safe_dump({"channels": [{"name": n} for n in ACQUIRED_CHANNELS]}))
+    return tmp_path
+
+
+def _ome_folder(tmp_path):
+    coords = pd.DataFrame({"region": ["A1"] * 3, "x (mm)": [1.0, 2.0, 3.0], "y (mm)": [5.0] * 3})
+    coords.to_csv(tmp_path / "coordinates.csv", index=False)
+    (tmp_path / "ome_tiff").mkdir()
+    stack = np.stack([CHANNEL_IMAGES[n] for n in ACQUIRED_CHANNELS])[np.newaxis, np.newaxis]  # TZCYX
+    tifffile.imwrite(
+        tmp_path / "ome_tiff" / "A1_1.ome.tiff",
+        stack,
+        ome=True,
+        metadata={"axes": "TZCYX", "Channel": {"Name": ACQUIRED_CHANNELS}},
+    )
+    return tmp_path
+
+
+def _align_to(widget, folder, monkeypatch):
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *args, **kwargs: str(folder))
+    widget.btn_align.click()
+
+
+def _overlay(image_display_window):
+    return image_display_window.alignment_reference_item.image
+
+
+def _channels(widget):
+    return [widget.combo_channel.itemText(i) for i in range(widget.combo_channel.count())]
+
+
+def test_channel_picker_lists_channels_in_acquisition_order_and_defaults_to_the_first(
+    widget, image_display_window, tmp_path, monkeypatch
+):
+    assert widget.combo_channel.isHidden()
+
+    _align_to(widget, _multichannel_folder(tmp_path), monkeypatch)
+
+    assert not widget.combo_channel.isHidden()
+    assert _channels(widget) == ACQUIRED_CHANNELS
+    assert np.array_equal(_overlay(image_display_window), CHANNEL_IMAGES["Fluorescence 488 nm Ex"])
+
+
+def test_channel_picker_falls_back_to_name_order_without_acquisition_yaml(widget, tmp_path, monkeypatch):
+    _align_to(widget, _multichannel_folder(tmp_path, with_yaml=False), monkeypatch)
+
+    assert _channels(widget) == sorted(n.replace(" ", "_") for n in ACQUIRED_CHANNELS)
+
+
+def test_picking_a_channel_overlays_it_and_auto_registers_against_it(
+    widget, image_display_window, tmp_path, monkeypatch
+):
+    requests = []
+    widget.signal_auto_align_requested.connect(requests.append)
+    _align_to(widget, _multichannel_folder(tmp_path), monkeypatch)
+
+    widget.combo_channel.setCurrentText("BF LED matrix full")
+    widget.btn_auto.click()
+
+    assert np.array_equal(_overlay(image_display_window), CHANNEL_IMAGES["BF LED matrix full"])
+    assert np.array_equal(requests[0], CHANNEL_IMAGES["BF LED matrix full"])
+
+
+def test_picked_channel_is_reused_for_the_next_alignment(widget, image_display_window, tmp_path, monkeypatch):
+    folder = _multichannel_folder(tmp_path)
+    _align_to(widget, folder, monkeypatch)
+    widget.combo_channel.setCurrentText("Fluorescence 405 nm Ex")
+    _confirm(widget, *CENTER_FOV_POSITION)
+    widget.btn_align.click()  # clear
+    assert widget.combo_channel.isHidden()
+
+    _align_to(widget, folder, monkeypatch)
+
+    assert widget.combo_channel.currentText() == "Fluorescence 405 nm Ex"
+    assert np.array_equal(_overlay(image_display_window), CHANNEL_IMAGES["Fluorescence 405 nm Ex"])
+
+
+def test_ome_tiff_channels_are_selectable_by_name(widget, image_display_window, tmp_path, monkeypatch):
+    _align_to(widget, _ome_folder(tmp_path), monkeypatch)
+
+    assert _channels(widget) == ACQUIRED_CHANNELS
+    assert np.array_equal(_overlay(image_display_window), CHANNEL_IMAGES["Fluorescence 488 nm Ex"])
+
+    widget.combo_channel.setCurrentText("Fluorescence 405 nm Ex")
+
+    assert np.array_equal(_overlay(image_display_window), CHANNEL_IMAGES["Fluorescence 405 nm Ex"])
 
 
 def test_button_tooltip_follows_the_workflow_state(widget):

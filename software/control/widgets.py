@@ -11791,6 +11791,8 @@ class AlignmentWidget(QWidget):
         self._has_offset = False
         self._reference_fov_position = None  # (x_mm, y_mm)
         self._reference_image = None
+        self._reference_sources = {}  # channel label -> (path, OME channel index or None), acquisition order
+        self._preferred_channel = None  # last channel picked; reused for the next alignment if present
         self._current_folder = None
         self._pending_position_request = False
 
@@ -11809,6 +11811,12 @@ class AlignmentWidget(QWidget):
         self.btn_align.clicked.connect(self._on_button_clicked)
         layout.addWidget(self.btn_align)
 
+        self.combo_channel = QComboBox()
+        self.combo_channel.setToolTip("Channel of the past acquisition to overlay")
+        self.combo_channel.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.combo_channel.currentIndexChanged.connect(self._on_channel_changed)
+        layout.addWidget(self.combo_channel)
+
         self.btn_auto = QPushButton("Auto")
         self.btn_auto.setCursor(Qt.PointingHandCursor)
         self.btn_auto.setToolTip("Move the stage to match the reference (needs Live)")
@@ -11823,6 +11831,7 @@ class AlignmentWidget(QWidget):
         enabled = self.btn_align.isEnabled()
         self.btn_align.setToolTip(self._BUTTON_TOOLTIP[state] if enabled else self._DISABLED_TOOLTIP)
         self.btn_auto.setVisible(state == self.STATE_CONFIRM)  # only while a reference is loaded
+        self.combo_channel.setVisible(state == self.STATE_CONFIRM)
 
     def enable(self):
         """Call when live view starts."""
@@ -11870,6 +11879,10 @@ class AlignmentWidget(QWidget):
         self._offset_x_mm = 0.0
         self._offset_y_mm = 0.0
         self._hide_reference()
+        self._reference_sources = {}
+        self.combo_channel.blockSignals(True)
+        self.combo_channel.clear()
+        self.combo_channel.blockSignals(False)
         self._set_state(self.STATE_ALIGN)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -11919,7 +11932,7 @@ class AlignmentWidget(QWidget):
             self._reference_fov_position = (ref_x, ref_y)
 
             self.signal_move_to_position.emit(ref_x, ref_y)
-            self._load_reference_image(info["image_path"])
+            self._set_reference_sources(info["reference_images"])
             self._set_state(self.STATE_CONFIRM)
             self._log.info(f"Alignment started: ref_pos=({ref_x:.4f}, {ref_y:.4f})")
 
@@ -11963,7 +11976,7 @@ class AlignmentWidget(QWidget):
         """
         Load acquisition info from a past acquisition folder.
 
-        Returns dict with: coordinates, first_region, center_fov_index, center_fov_position, image_path
+        Returns dict with: coordinates, first_region, center_fov_index, center_fov_position, reference_images
         """
         folder = Path(folder_path)
 
@@ -11980,7 +11993,7 @@ class AlignmentWidget(QWidget):
         center_fov = region_coords.iloc[center_idx]
         center_fov_position = (float(center_fov["x (mm)"]), float(center_fov["y (mm)"]))
 
-        image_path = self._find_reference_image(folder, first_region, center_idx)
+        reference_images = self._find_reference_images(folder, first_region, center_idx)
 
         self._log.info(
             f"Loaded acquisition info: region={first_region}, "
@@ -11993,7 +12006,7 @@ class AlignmentWidget(QWidget):
             "first_region": first_region,
             "center_fov_index": center_idx,
             "center_fov_position": center_fov_position,
-            "image_path": str(image_path),
+            "reference_images": reference_images,
         }
 
     def _find_center_fov(self, region_coords: "pd.DataFrame") -> int:
@@ -12005,45 +12018,118 @@ class AlignmentWidget(QWidget):
         distances_sq = (x - center_x) ** 2 + (y - center_y) ** 2
         return int(distances_sq.argmin())
 
-    def _find_reference_image(self, folder: Path, region: str, fov_idx: int) -> Path:
-        """Find reference image in OME-TIFF or traditional timepoint folders."""
-        # Try OME-TIFF folder first
-        ome_tiff_folder = folder / "ome_tiff"
-        if ome_tiff_folder.exists():
-            ome_images = list(ome_tiff_folder.glob(f"{region}_{fov_idx}.ome.tiff"))
-            if ome_images:
-                self._log.info(f"Found OME-TIFF image: {ome_images[0]}")
-                return ome_images[0]
+    def _find_reference_images(self, folder: Path, region: str, fov_idx: int) -> dict:
+        """Find every channel saved at this FOV, in acquisition order.
 
-        # Try traditional timepoint folders
+        Returns {channel label: (path, channel index)}; the index is the C plane inside an OME-TIFF and
+        None for the one-image-per-channel formats.
+        """
+        # Try OME-TIFF folder first
+        ome_path = folder / "ome_tiff" / f"{region}_{fov_idx}.ome.tiff"
+        if ome_path.exists():
+            self._log.info(f"Found OME-TIFF image: {ome_path}")
+            return {name: (ome_path, idx) for idx, name in enumerate(self._ome_channel_names(ome_path))}
+
+        # Try traditional timepoint folders: one file per channel, named {region}_{fov}_{z}_{channel}.{ext}
         timepoint_folders = sorted(
             [d for d in folder.iterdir() if d.is_dir() and d.name.isdigit()],
             key=lambda x: int(x.name),
         )
         if timepoint_folders:
             last_timepoint = timepoint_folders[-1]
+            prefix = f"{region}_{fov_idx}_0_"
             for ext in ("tiff", "tif", "bmp"):
-                images = sorted(last_timepoint.glob(f"{region}_{fov_idx}_0_*.{ext}"))
+                images = sorted(last_timepoint.glob(f"{prefix}*.{ext}"))
                 if images:
-                    self._log.info(f"Found traditional format image: {images[0]}")
-                    return images[0]
+                    by_file_name = {p.name[len(prefix) : -len(ext) - 1]: p for p in images}
+                    self._log.info(f"Found traditional format images: {[p.name for p in images]}")
+                    return self._order_by_acquisition(folder, by_file_name)
 
         raise FileNotFoundError(
             f"No images found for region={region}, FOV={fov_idx} in {folder}. "
             f"Checked ome_tiff folder and timepoint folders."
         )
 
+    def _order_by_acquisition(self, folder: Path, by_file_name: dict) -> dict:
+        """Order {file-safe channel name: path} as the channels were acquired, using acquisition.yaml.
+
+        File names replace spaces with underscores, so channels are matched on that form and labelled
+        with their real names. Channels not listed (or no acquisition.yaml) follow, in name order.
+        """
+        acquired = []
+        yaml_path = folder / "acquisition.yaml"
+        if yaml_path.exists():
+            try:
+                with open(yaml_path) as f:
+                    channels = (yaml.safe_load(f) or {}).get("channels") or []
+                acquired = [ch["name"] for ch in channels if isinstance(ch, dict) and ch.get("name")]
+            except Exception as e:
+                self._log.warning(f"Could not read channel order from {yaml_path}: {e}")
+
+        remaining = dict(by_file_name)
+        ordered = {}
+        for name in acquired:
+            path = remaining.pop(name.replace(" ", "_"), None)
+            if path is not None:
+                ordered[name] = (path, None)
+        ordered.update({file_name: (path, None) for file_name, path in remaining.items()})
+        return ordered
+
+    @staticmethod
+    def _ome_channel_names(path: Path) -> list:
+        """Channel names of an OME-TIFF, in C order (generic names if the metadata has none)."""
+        import xml.etree.ElementTree as ET
+
+        import tifffile
+
+        with tifffile.TiffFile(path) as tif:
+            series = tif.series[0]
+            size_c = series.shape[series.axes.index("C")] if "C" in series.axes else 1
+            names = []
+            if tif.ome_metadata:
+                root = ET.fromstring(tif.ome_metadata)
+                pixels = next((el for el in root.iter() if el.tag.endswith("}Pixels")), None)
+                if pixels is not None:
+                    names = [el.get("Name") for el in pixels if el.tag.endswith("}Channel")]
+        if len(names) != size_c or not all(names):
+            names = [f"Channel {idx}" for idx in range(size_c)]
+        return names
+
+    def _set_reference_sources(self, sources: dict):
+        """Fill the channel picker and overlay the preferred channel (last picked, else first acquired)."""
+        self._reference_sources = sources
+        labels = list(sources)
+        self.combo_channel.blockSignals(True)
+        self.combo_channel.clear()
+        self.combo_channel.addItems(labels)
+        self.combo_channel.setCurrentIndex(labels.index(self._preferred_channel) if self._preferred_channel in labels else 0)
+        self.combo_channel.blockSignals(False)
+        self._load_selected_channel()
+
+    def _on_channel_changed(self, _index: int):
+        if self.combo_channel.currentText():
+            self._preferred_channel = self.combo_channel.currentText()
+            self._load_selected_channel()
+
+    def _load_selected_channel(self):
+        path, channel_index = self._reference_sources[self.combo_channel.currentText()]
+        self._load_reference_image(str(path), channel_index)
+
     # ─────────────────────────────────────────────────────────────────────────
     # Reference Overlay
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _load_reference_image(self, image_path: str):
-        """Load reference image and overlay it on the live view."""
+    def _load_reference_image(self, image_path: str, channel_index: Optional[int] = None):
+        """Load reference image (one OME-TIFF channel when channel_index is given) and overlay it on the live view."""
         import tifffile
 
         if image_path.endswith((".tiff", ".tif", ".ome.tiff", ".ome.tif")):
-            ref_image = tifffile.imread(image_path)
-            # Reduce multi-dimensional images (T, C, Z, Y, X) to 2D
+            with tifffile.TiffFile(image_path) as tif:
+                series = tif.series[0]
+                ref_image = series.asarray()
+                if channel_index is not None and "C" in series.axes:
+                    ref_image = np.take(ref_image, channel_index, axis=series.axes.index("C"))
+            # Reduce the remaining dimensions (T, Z) to their first plane
             while ref_image.ndim > 2:
                 ref_image = ref_image[0]
             self._log.info(f"Loaded TIFF reference image, shape: {ref_image.shape}")
