@@ -12102,7 +12102,9 @@ class AlignmentWidget(QWidget):
         self.combo_channel.blockSignals(True)
         self.combo_channel.clear()
         self.combo_channel.addItems(labels)
-        self.combo_channel.setCurrentIndex(labels.index(self._preferred_channel) if self._preferred_channel in labels else 0)
+        self.combo_channel.setCurrentIndex(
+            labels.index(self._preferred_channel) if self._preferred_channel in labels else 0
+        )
         self.combo_channel.blockSignals(False)
         self._load_selected_channel()
 

@@ -225,17 +225,23 @@ CHANNEL_IMAGES = {name: np.full((32, 32), 1000 * (i + 1), dtype=np.uint16) for i
 
 
 def _multichannel_folder(tmp_path, with_yaml=True):
+    tmp_path = tmp_path / "multichannel"  # the widget fixture already holds an acquisition in tmp_path
+    tmp_path.mkdir()
     coords = pd.DataFrame({"region": ["A1"] * 3, "x (mm)": [1.0, 2.0, 3.0], "y (mm)": [5.0] * 3})
     coords.to_csv(tmp_path / "coordinates.csv", index=False)
     (tmp_path / "0").mkdir()
     for name, image in CHANNEL_IMAGES.items():
         tifffile.imwrite(tmp_path / "0" / f"A1_1_0_{name.replace(' ', '_')}.tiff", image)
     if with_yaml:
-        (tmp_path / "acquisition.yaml").write_text(yaml.safe_dump({"channels": [{"name": n} for n in ACQUIRED_CHANNELS]}))
+        (tmp_path / "acquisition.yaml").write_text(
+            yaml.safe_dump({"channels": [{"name": n} for n in ACQUIRED_CHANNELS]})
+        )
     return tmp_path
 
 
 def _ome_folder(tmp_path):
+    tmp_path = tmp_path / "ome"  # the widget fixture already holds an acquisition in tmp_path
+    tmp_path.mkdir()
     coords = pd.DataFrame({"region": ["A1"] * 3, "x (mm)": [1.0, 2.0, 3.0], "y (mm)": [5.0] * 3})
     coords.to_csv(tmp_path / "coordinates.csv", index=False)
     (tmp_path / "ome_tiff").mkdir()
